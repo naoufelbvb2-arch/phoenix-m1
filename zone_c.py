@@ -25,21 +25,30 @@ from task_m1 import VOCAB_SIZE
 
 
 class ZoneC(nn.Module):
-    def __init__(self, n_query: int = 4):
+    """
+    n_values independent read+classify heads (default 2, backward-compatible with
+    M1/PCR).  Each head i has its own learned query set (address) and MLP head;
+    forward returns a tuple of n_values logit tensors.  out_dim defaults to the
+    M1 vocab; pass a smaller out_dim for tasks with smaller value vocabularies.
+    """
+    def __init__(self, n_query: int = 4, n_values: int = 2, out_dim: int = VOCAB_SIZE):
         super().__init__()
         self.n_query = n_query
-        # Separate learned query sets (addresses) for v0 and v1, in D_ADDR space
-        # so they dot directly against the frozen board keys.  randn init (std 1)
-        # so the queries start differentiated (slot-collapse lesson from Zone B).
-        self.q0 = nn.Parameter(torch.randn(n_query, D_ADDR))
-        self.q1 = nn.Parameter(torch.randn(n_query, D_ADDR))
-        self.head0 = self._make_head(n_query * D_VAL)
-        self.head1 = self._make_head(n_query * D_VAL)
+        self.n_values = n_values
+        # Separate learned query sets (addresses) in D_ADDR space so they dot
+        # directly against the frozen board keys.  randn init (std 1) so the
+        # queries start differentiated (slot-collapse lesson from Zone B).
+        self.queries = nn.ParameterList(
+            [nn.Parameter(torch.randn(n_query, D_ADDR)) for _ in range(n_values)]
+        )
+        self.heads = nn.ModuleList(
+            [self._make_head(n_query * D_VAL, out_dim) for _ in range(n_values)]
+        )
 
     @staticmethod
-    def _make_head(in_dim: int) -> nn.Sequential:
+    def _make_head(in_dim: int, out_dim: int) -> nn.Sequential:
         h = nn.Sequential(
-            nn.Linear(in_dim, 128), nn.GELU(), nn.Linear(128, VOCAB_SIZE),
+            nn.Linear(in_dim, 128), nn.GELU(), nn.Linear(128, out_dim),
         )
         nn.init.zeros_(h[-1].weight)   # Safe-Zero: neutral logits at init
         nn.init.zeros_(h[-1].bias)
@@ -57,6 +66,7 @@ class ZoneC(nn.Module):
         return ctx.reshape(B, -1)                               # (B, n_query*D_VAL)
 
     def forward(self, board_keys: torch.Tensor, board_vals: torch.Tensor):
-        c0 = self._read(self.q0, board_keys, board_vals)
-        c1 = self._read(self.q1, board_keys, board_vals)
-        return self.head0(c0), self.head1(c1)
+        return tuple(
+            self.heads[i](self._read(self.queries[i], board_keys, board_vals))
+            for i in range(self.n_values)
+        )
